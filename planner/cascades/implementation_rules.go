@@ -49,6 +49,9 @@ var defaultImplementationMap = map[memo.Operand][]ImplementationRule{
 	memo.OperandIndexScan: {
 		&ImplIndexScan{},
 	},
+	memo.OperandIndexSkipScan: {
+		&ImplIndexSkipScan{},
+	},
 	memo.OperandTiKVSingleGather: {
 		&ImplTiKVSingleReadGather{},
 	},
@@ -203,6 +206,29 @@ func (*ImplTableScan) OnImplement(expr *memo.GroupExpr, reqProp *property.Physic
 	}
 	tblCols, tblColHists := logicalScan.Source.TblCols, logicalScan.Source.TblColHists
 	return []memo.Implementation{impl.NewTableScanImpl(ts, tblCols, tblColHists)}, nil
+}
+
+// ImplIndexSkipScan implements IndexScan as PhysicalIndexScan.
+type ImplIndexSkipScan struct {
+}
+
+// Match implements ImplementationRule Match interface.
+func (*ImplIndexSkipScan) Match(expr *memo.GroupExpr, prop *property.PhysicalProperty) (matched bool) {
+	is := expr.ExprNode.(*plannercore.LogicalIndexScan)
+	return is.MatchIndexProp(prop)
+}
+
+// OnImplement implements ImplementationRule OnImplement interface.
+func (*ImplIndexSkipScan) OnImplement(expr *memo.GroupExpr, reqProp *property.PhysicalProperty) ([]memo.Implementation, error) {
+	logicalScan := expr.ExprNode.(*plannercore.LogicalIndexScan)
+	is := logicalScan.GetPhysicalIndexSkipScan(expr.Group.Prop.Schema, expr.Group.Prop.Stats.ScaleByExpectCnt(reqProp.ExpectedCnt))
+	if !reqProp.IsSortItemEmpty() {
+		is.KeepOrder = true
+		if reqProp.SortItems[0].Desc {
+			is.Desc = true
+		}
+	}
+	return []memo.Implementation{impl.NewIndexSkipScanImpl(is, logicalScan.Source.TblColHists)}, nil
 }
 
 // ImplIndexScan implements IndexScan as PhysicalIndexScan.

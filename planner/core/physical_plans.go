@@ -623,6 +623,128 @@ func (p *PhysicalIndexMergeReader) MemoryUsage() (sum int64) {
 	return
 }
 
+// PhysicalIndexSkipScan represents an index scan plan.
+type PhysicalIndexSkipScan struct {
+	physicalSchemaProducer
+
+	// AccessCondition is used to calculate range.
+	AccessCondition []expression.Expression
+
+	Table      *model.TableInfo
+	Index      *model.IndexInfo
+	IdxCols    []*expression.Column
+	IdxColLens []int
+	Ranges     []*ranger.Range
+	Columns    []*model.ColumnInfo
+	DBName     model.CIStr
+
+	TableAsName *model.CIStr
+
+	// dataSourceSchema is the original schema of DataSource. The schema of index scan in KV and index reader in TiDB
+	// will be different. The schema of index scan will decode all columns of index but the TiDB only need some of them.
+	dataSourceSchema *expression.Schema
+
+	// Hist is the histogram when the query was issued.
+	// It is used for query feedback.
+	Hist *statistics.Histogram
+
+	rangeInfo string
+
+	// The index scan may be on a partition.
+	physicalTableID int64
+
+	GenExprs map[model.TableItemID]expression.Expression
+
+	isPartition bool
+	Desc        bool
+	KeepOrder   bool
+	// DoubleRead means if the index executor will read kv two times.
+	// If the query requires the columns that don't belong to index, DoubleRead will be true.
+	DoubleRead bool
+
+	NeedCommonHandle bool
+
+	// required by cost model
+	// tblColHists contains all columns before pruning, which are used to calculate row-size
+	tblColHists   *statistics.HistColl
+	pkIsHandleCol *expression.Column
+	prop          *property.PhysicalProperty
+}
+
+// Clone implements PhysicalPlan interface.
+func (p *PhysicalIndexSkipScan) Clone() (PhysicalPlan, error) {
+	cloned := new(PhysicalIndexSkipScan)
+	*cloned = *p
+	base, err := p.physicalSchemaProducer.cloneWithSelf(cloned)
+	if err != nil {
+		return nil, err
+	}
+	cloned.physicalSchemaProducer = *base
+	cloned.AccessCondition = cloneExprs(p.AccessCondition)
+	if p.Table != nil {
+		cloned.Table = p.Table.Clone()
+	}
+	if p.Index != nil {
+		cloned.Index = p.Index.Clone()
+	}
+	cloned.IdxCols = cloneCols(p.IdxCols)
+	cloned.IdxColLens = make([]int, len(p.IdxColLens))
+	copy(cloned.IdxColLens, p.IdxColLens)
+	cloned.Ranges = cloneRanges(p.Ranges)
+	cloned.Columns = cloneColInfos(p.Columns)
+	if p.dataSourceSchema != nil {
+		cloned.dataSourceSchema = p.dataSourceSchema.Clone()
+	}
+	if p.Hist != nil {
+		cloned.Hist = p.Hist.Copy()
+	}
+	return cloned, nil
+}
+
+// ExtractCorrelatedCols implements PhysicalPlan interface.
+func (p *PhysicalIndexSkipScan) ExtractCorrelatedCols() []*expression.CorrelatedColumn {
+	corCols := make([]*expression.CorrelatedColumn, 0, len(p.AccessCondition))
+	for _, expr := range p.AccessCondition {
+		corCols = append(corCols, expression.ExtractCorColumns(expr)...)
+	}
+	return corCols
+}
+
+const emptyPhysicalIndexSkipScanSize = int64(unsafe.Sizeof(PhysicalIndexSkipScan{}))
+
+// MemoryUsage return the memory usage of PhysicalIndexSkipScan
+func (p *PhysicalIndexSkipScan) MemoryUsage() (sum int64) {
+	if p == nil {
+		return
+	}
+
+	sum = emptyPhysicalIndexSkipScanSize + p.physicalSchemaProducer.MemoryUsage() + int64(cap(p.IdxColLens))*size.SizeOfInt +
+		p.DBName.MemoryUsage() + int64(len(p.rangeInfo))
+	if p.TableAsName != nil {
+		sum += p.TableAsName.MemoryUsage()
+	}
+	if p.pkIsHandleCol != nil {
+		sum += p.pkIsHandleCol.MemoryUsage()
+	}
+	if p.prop != nil {
+		sum += p.prop.MemoryUsage()
+	}
+	// slice memory usage
+	for _, cond := range p.AccessCondition {
+		sum += cond.MemoryUsage()
+	}
+	for _, col := range p.IdxCols {
+		sum += col.MemoryUsage()
+	}
+	for _, rang := range p.Ranges {
+		sum += rang.MemUsage()
+	}
+	for iid, expr := range p.GenExprs {
+		sum += int64(unsafe.Sizeof(iid)) + expr.MemoryUsage()
+	}
+	return
+}
+
 // PhysicalIndexScan represents an index scan plan.
 type PhysicalIndexScan struct {
 	physicalSchemaProducer

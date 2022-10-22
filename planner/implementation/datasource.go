@@ -195,3 +195,31 @@ func NewIndexScanImpl(scan *plannercore.PhysicalIndexScan, tblColHists *statisti
 		tblColHists: tblColHists,
 	}
 }
+
+// IndexSkipScanImpl is the Implementation of PhysicalIndexSkipScan.
+type IndexSkipScanImpl struct {
+	baseImpl
+	tblColHists *statistics.HistColl
+}
+
+// CalcCost implements Implementation interface.
+func (impl *IndexSkipScanImpl) CalcCost(outCount float64, _ ...memo.Implementation) float64 {
+	is := impl.plan.(*plannercore.PhysicalIndexSkipScan)
+	sessVars := is.SCtx().GetSessionVars()
+	rowSize := impl.tblColHists.GetIndexAvgRowSize(is.SCtx(), is.Schema().Columns, is.Index.Unique)
+	cost := outCount * rowSize * sessVars.GetScanFactor(is.Table)
+	if is.Desc {
+		cost = outCount * rowSize * sessVars.GetDescScanFactor(is.Table)
+	}
+	cost += float64(len(is.Ranges)) * sessVars.GetSeekFactor(is.Table)
+	impl.cost = cost
+	return impl.cost
+}
+
+// NewIndexSkipScanImpl creates a new IndexSkipScan Implementation.
+func NewIndexSkipScanImpl(scan *plannercore.PhysicalIndexSkipScan, tblColHists *statistics.HistColl) *IndexSkipScanImpl {
+	return &IndexSkipScanImpl{
+		baseImpl:    baseImpl{plan: scan},
+		tblColHists: tblColHists,
+	}
+}

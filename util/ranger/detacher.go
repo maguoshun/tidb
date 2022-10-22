@@ -62,6 +62,39 @@ func detachColumnCNFConditions(sctx sessionctx.Context, conditions []expression.
 	return accessConditions, filterConditions
 }
 
+// detachColumnCNFConditions detaches the condition for calculating range from the other conditions.
+// Please make sure that the top level is CNF form.
+func detachColumnCNFConditionsForSkipScan(sctx sessionctx.Context, conditions []expression.Expression, checker *conditionChecker) ([]expression.Expression, []expression.Expression) {
+	var accessConditions, filterConditions []expression.Expression //nolint: prealloc
+	for _, cond := range conditions {
+		if sf, ok := cond.(*expression.ScalarFunction); ok && sf.FuncName.L == ast.LogicOr {
+			dnfItems := expression.FlattenDNFConditions(sf)
+			columnDNFItems, hasResidual := detachColumnDNFConditions(sctx, dnfItems, checker)
+			// If this CNF has expression that cannot be resolved as access condition, then the total DNF expression
+			// should be also appended into filter condition.
+			if hasResidual {
+				filterConditions = append(filterConditions, cond)
+			}
+			if len(columnDNFItems) == 0 {
+				continue
+			}
+			rebuildDNF := expression.ComposeDNFCondition(sctx, columnDNFItems...)
+			accessConditions = append(accessConditions, rebuildDNF)
+			continue
+		}
+		// if !checker.check(cond) {
+		// 	filterConditions = append(filterConditions, cond)
+		// 	continue
+		// }
+		accessConditions = append(accessConditions, cond)
+		if checker.shouldReserve {
+			filterConditions = append(filterConditions, cond)
+			checker.shouldReserve = checker.length != types.UnspecifiedLength
+		}
+	}
+	return accessConditions, filterConditions
+}
+
 // detachColumnDNFConditions detaches the condition for calculating range from the other conditions.
 // Please make sure that the top level is DNF form.
 func detachColumnDNFConditions(sctx sessionctx.Context, conditions []expression.Expression, checker *conditionChecker) ([]expression.Expression, bool) {
@@ -397,6 +430,173 @@ func (d *rangeDetacher) detachCNFCondAndBuildRangeForIndex(conditions []expressi
 		}
 		// `eqOrInCount` must be 0 when coming here.
 		res.AccessConds, res.RemainedConds = detachColumnCNFConditions(d.sctx, newConditions, checker)
+		ranges, res.AccessConds, remainedConds, err = d.buildCNFIndexRange(tpSlice, 0, res.AccessConds)
+		if err != nil {
+			return nil, err
+		}
+		// detachColumnCNFConditions extracts `a = 10 or a = 30` from `(a = 10 and b = 20) or (a = 30 and b = 40)`. If
+		// [10, 10] [30, 30] exceeds range mem limit, we add `a = 10 or a = 30` back to RemainedConds, which is actually
+		// unnecessary because `(a = 10 and b = 20) or (a = 30 and b = 40)` is already in RemainedConds.
+		// TODO: we will optimize it later.
+		res.RemainedConds = AppendConditionsIfNotExist(res.RemainedConds, remainedConds)
+		res.Ranges = ranges
+		return res, nil
+	}
+	for _, cond := range newConditions {
+		if !checker.check(cond) {
+			filterConds = append(filterConds, cond)
+			continue
+		}
+		accessConds = append(accessConds, cond)
+		// TODO: if it's prefix column, we need to add cond to filterConds?
+	}
+	ranges, accessConds, remainedConds, err = d.buildCNFIndexRange(tpSlice, eqOrInCount, accessConds)
+	if err != nil {
+		return nil, err
+	}
+	filterConds = append(filterConds, remainedConds...)
+	res.Ranges = ranges
+	res.AccessConds = accessConds
+	res.RemainedConds = filterConds
+	return res, nil
+}
+
+// detachCNFCondAndBuildRangeForSkipIndex will detach the index filters from table filters. These conditions are connected with `and`
+// It will first find the point query column and then extract the range query column.
+// considerDNF is true means it will try to extract access conditions from the DNF expressions.
+func (d *rangeDetacher) detachCNFCondAndBuildRangeForSkipIndex(conditions []expression.Expression, tpSlice []*types.FieldType, considerDNF bool) (*DetachRangeResult, error) {
+	var (
+		eqCount int
+		ranges  Ranges
+		err     error
+	)
+	res := &DetachRangeResult{}
+
+	accessConds, filterConds, newConditions, columnValues, emptyRange := ExtractEqAndInCondition(d.sctx, conditions, d.cols, d.lengths)
+	if emptyRange {
+		return res, nil
+	}
+	var remainedConds []expression.Expression
+	ranges, accessConds, remainedConds, err = d.buildRangeOnColsByCNFCond(tpSlice, len(accessConds), accessConds)
+	if err != nil {
+		return nil, err
+	}
+	if len(remainedConds) > 0 {
+		filterConds = removeConditions(filterConds, remainedConds)
+		newConditions = append(newConditions, remainedConds...)
+	}
+	for ; eqCount < len(accessConds); eqCount++ {
+		if accessConds[eqCount].(*expression.ScalarFunction).FuncName.L != ast.EQ {
+			break
+		}
+	}
+	eqOrInCount := len(accessConds)
+	res.EqCondCount = eqCount
+	res.EqOrInCount = eqOrInCount
+	// If index has prefix column and d.mergeConsecutive is true, ranges may not be point ranges anymore after UnionRanges.
+	// Therefore, we need to calculate pointRanges separately so that it can be used to append tail ranges in considerDNF branch.
+	// See https://github.com/pingcap/tidb/issues/26029 for details.
+	var pointRanges Ranges
+	if hasPrefix(d.lengths) && fixPrefixColRange(ranges, d.lengths, tpSlice) {
+		if d.mergeConsecutive {
+			pointRanges = make(Ranges, 0, len(ranges))
+			for _, ran := range ranges {
+				pointRanges = append(pointRanges, ran.Clone())
+			}
+			ranges, err = UnionRanges(d.sctx, ranges, d.mergeConsecutive)
+			if err != nil {
+				return nil, errors.Trace(err)
+			}
+			pointRanges, err = UnionRanges(d.sctx, pointRanges, false)
+			if err != nil {
+				return nil, errors.Trace(err)
+			}
+		} else {
+			ranges, err = UnionRanges(d.sctx, ranges, d.mergeConsecutive)
+			if err != nil {
+				return nil, errors.Trace(err)
+			}
+			pointRanges = ranges
+		}
+	} else {
+		pointRanges = ranges
+	}
+
+	res.Ranges = ranges
+	res.AccessConds = accessConds
+	res.RemainedConds = filterConds
+	res.ColumnValues = columnValues
+	if eqOrInCount == len(d.cols) || len(newConditions) == 0 {
+		res.RemainedConds = append(res.RemainedConds, newConditions...)
+		return res, nil
+	}
+	checker := &conditionChecker{
+		checkerCol:    d.cols[eqOrInCount],
+		length:        d.lengths[eqOrInCount],
+		shouldReserve: d.lengths[eqOrInCount] != types.UnspecifiedLength,
+	}
+	if considerDNF {
+		pointRes, offset, columnValues, err := extractIndexPointRangesForCNF(d.sctx, conditions, d.cols, d.lengths, d.rangeMaxSize)
+		if err != nil {
+			return nil, err
+		}
+		res.ColumnValues = unionColumnValues(res.ColumnValues, columnValues)
+		if pointRes != nil {
+			if len(pointRes.Ranges) == 0 {
+				return &DetachRangeResult{}, nil
+			}
+			if len(pointRes.Ranges[0].LowVal) > eqOrInCount {
+				pointRes.ColumnValues = res.ColumnValues
+				res = pointRes
+				pointRanges = pointRes.Ranges
+				eqOrInCount = len(res.Ranges[0].LowVal)
+				newConditions = newConditions[:0]
+				newConditions = append(newConditions, conditions[:offset]...)
+				newConditions = append(newConditions, conditions[offset+1:]...)
+				if eqOrInCount == len(d.cols) || len(newConditions) == 0 {
+					res.RemainedConds = append(res.RemainedConds, newConditions...)
+					return res, nil
+				}
+			}
+		}
+		if eqOrInCount > 0 {
+			newCols := d.cols[eqOrInCount:]
+			newLengths := d.lengths[eqOrInCount:]
+			tailRes, err := DetachCondAndBuildRangeForIndex(d.sctx, newConditions, newCols, newLengths, d.rangeMaxSize)
+			if err != nil {
+				return nil, err
+			}
+			if len(tailRes.Ranges) == 0 {
+				return &DetachRangeResult{}, nil
+			}
+			if len(tailRes.AccessConds) > 0 {
+				newRanges, rangeFallback := AppendRanges2PointRanges(pointRanges, tailRes.Ranges, d.rangeMaxSize)
+				if rangeFallback {
+					d.sctx.GetSessionVars().StmtCtx.RecordRangeFallback(d.rangeMaxSize)
+					res.RemainedConds = append(res.RemainedConds, tailRes.AccessConds...)
+					// Some conditions may be in both tailRes.AccessConds and tailRes.RemainedConds so we call AppendConditionsIfNotExist here.
+					res.RemainedConds = AppendConditionsIfNotExist(res.RemainedConds, tailRes.RemainedConds)
+					return res, nil
+				}
+				res.Ranges = newRanges
+				res.AccessConds = append(res.AccessConds, tailRes.AccessConds...)
+				res.RemainedConds = append(res.RemainedConds, tailRes.RemainedConds...)
+				// For cases like `((a = 1 and b = 1) or (a = 2 and b = 2)) and c = 1` on index (a,b,c), eqOrInCount is 2,
+				// res.EqOrInCount is 0, and tailRes.EqOrInCount is 1. We should not set res.EqOrInCount to 1, otherwise,
+				// `b = CorrelatedColumn` would be extracted as access conditions as well, which is not as expected at least for now.
+				if res.EqOrInCount > 0 {
+					if res.EqOrInCount == res.EqCondCount {
+						res.EqCondCount = res.EqCondCount + tailRes.EqCondCount
+					}
+					res.EqOrInCount = res.EqOrInCount + tailRes.EqOrInCount
+				}
+				return res, nil
+			}
+			res.RemainedConds = append(res.RemainedConds, tailRes.RemainedConds...)
+			return res, nil
+		}
+		// `eqOrInCount` must be 0 when coming here.
+		res.AccessConds, res.RemainedConds = detachColumnCNFConditionsForSkipScan(d.sctx, newConditions, checker)
 		ranges, res.AccessConds, remainedConds, err = d.buildCNFIndexRange(tpSlice, 0, res.AccessConds)
 		if err != nil {
 			return nil, err
@@ -817,6 +1017,27 @@ func DetachCondAndBuildRangeForIndex(sctx sessionctx.Context, conditions []expre
 		rangeMaxSize:     rangeMaxSize,
 	}
 	return d.detachCondAndBuildRangeForCols()
+}
+
+// DetachCondAndBuildRangeForIndex will detach the index filters from table filters.
+// rangeMaxSize is the max memory limit for ranges. O indicates no memory limit. If you ask that all conditions must be used
+// for building ranges, set rangeMemQuota to 0 to avoid range fallback.
+// The returned values are encapsulated into a struct DetachRangeResult, see its comments for explanation.
+func DetachCondAndBuildRangeForSkipIndex(sctx sessionctx.Context, conditions []expression.Expression, cols []*expression.Column,
+	lengths []int, rangeMaxSize int64) (*DetachRangeResult, error) {
+	d := &rangeDetacher{
+		sctx:             sctx,
+		allConds:         conditions,
+		cols:             cols,
+		lengths:          lengths,
+		mergeConsecutive: true,
+		rangeMaxSize:     rangeMaxSize,
+	}
+	newTpSlice := make([]*types.FieldType, 0, len(d.cols))
+	for _, col := range d.cols {
+		newTpSlice = append(newTpSlice, newFieldType(col.RetType))
+	}
+	return d.detachCNFCondAndBuildRangeForSkipIndex(d.allConds, newTpSlice, true)
 }
 
 // DetachCondAndBuildRangeForPartition will detach the index filters from table filters.

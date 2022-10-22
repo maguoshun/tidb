@@ -123,6 +123,7 @@ var TiKVLayerOptimizationBatch = TransformationRuleBatch{
 		NewRulePushSelDownTiKVSingleGather(),
 		NewRulePushSelDownTableScan(),
 		NewRulePushSelDownIndexScan(),
+		NewRulePushSelDownIndexSkipScan(),
 		NewRuleMergeAdjacentSelection(),
 	},
 	memo.OperandAggregation: {
@@ -218,6 +219,93 @@ func (*PushSelDownTableScan) OnTransform(old *memo.ExprIter) (newExprs []*memo.G
 	selExpr := memo.NewGroupExpr(newSel)
 	selExpr.Children = append(selExpr.Children, tblScanGroup)
 	// `sel -> ts` is transformed to `newSel ->newTS`.
+	return []*memo.GroupExpr{selExpr}, true, false, nil
+}
+
+// RulePushSelDownIndexSkipScan pushes a Selection down to IndexScan.
+type PushSelDownIndexSkipScan struct {
+	baseRule
+}
+
+// NewRulePushSelDownIndexSkipScan creates a new Transformation RulePushSelDownIndexSkipScan.
+// The pattern of this rule is `Selection -> IndexSkipScan`.
+func NewRulePushSelDownIndexSkipScan() Transformation {
+	rule := &PushSelDownIndexSkipScan{}
+	rule.pattern = memo.BuildPattern(
+		memo.OperandSelection,
+		memo.EngineTiKVOnly,
+		memo.NewPattern(memo.OperandIndexSkipScan, memo.EngineTiKVOnly),
+	)
+	return rule
+}
+
+func (*PushSelDownIndexSkipScan) Match(expr *memo.ExprIter) bool {
+	// TODO: add more match rule
+	return true
+}
+
+// OnTransform implements Transformation interface.
+// It will transform `Selection -> IndexScan` to:
+//
+//	  `IndexScan(with a new access range)` or
+//	  `Selection -> IndexSkipScan(with a new access range)`
+//		 or just keep the two GroupExprs unchanged.
+func (*PushSelDownIndexSkipScan) OnTransform(old *memo.ExprIter) (newExprs []*memo.GroupExpr, eraseOld bool, eraseAll bool, err error) {
+	sel := old.GetExpr().ExprNode.(*plannercore.LogicalSelection)
+	is := old.Children[0].GetExpr().ExprNode.(*plannercore.LogicalIndexScan)
+	if len(is.IdxCols) == 0 {
+		return nil, false, false, nil
+	}
+	conditions := sel.Conditions
+	if is.AccessConds != nil {
+		// If we have already pushed some conditions down here,
+		// we merge old AccessConds with new conditions,
+		// to make sure this rule can be applied more than once.
+		conditions = make([]expression.Expression, len(sel.Conditions)+len(is.AccessConds))
+		copy(conditions, sel.Conditions)
+		copy(conditions[len(sel.Conditions):], is.AccessConds)
+	}
+	res, err := ranger.DetachCondAndBuildRangeForSkipIndex(is.SCtx(), conditions, is.IdxCols, is.IdxColLens, is.SCtx().GetSessionVars().RangeMaxSize)
+	if err != nil {
+		return nil, false, false, err
+	}
+	if len(res.AccessConds) == len(is.AccessConds) {
+		// There is no condition can be pushed down as range,
+		// or the pushed down conditions are the same with before.
+		sameConds := true
+		for i := range res.AccessConds {
+			if !res.AccessConds[i].Equal(is.SCtx(), is.AccessConds[i]) {
+				sameConds = false
+				break
+			}
+		}
+		if sameConds {
+			return nil, false, false, nil
+		}
+	}
+	// TODO: `res` still has some unused fields: EqOrInCount, IsDNFCond.
+	newIs := plannercore.LogicalIndexScan{
+		Source:         is.Source,
+		IsDoubleRead:   is.IsDoubleRead,
+		EqCondCount:    res.EqCondCount,
+		AccessConds:    res.AccessConds,
+		Ranges:         res.Ranges,
+		Index:          is.Index,
+		Columns:        is.Columns,
+		FullIdxCols:    is.FullIdxCols,
+		FullIdxColLens: is.FullIdxColLens,
+		IdxCols:        is.IdxCols,
+		IdxColLens:     is.IdxColLens,
+	}.Init(is.SCtx(), is.SelectBlockOffset())
+	isExpr := memo.NewGroupExpr(newIs)
+
+	if len(res.RemainedConds) == 0 {
+		return []*memo.GroupExpr{isExpr}, true, false, nil
+	}
+	isGroup := memo.NewGroupWithSchema(isExpr, old.Children[0].GetExpr().Group.Prop.Schema)
+	newSel := plannercore.LogicalSelection{Conditions: res.RemainedConds}.Init(sel.SCtx(), sel.SelectBlockOffset())
+	selExpr := memo.NewGroupExpr(newSel)
+	selExpr.SetChildren(isGroup)
 	return []*memo.GroupExpr{selExpr}, true, false, nil
 }
 

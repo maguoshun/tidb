@@ -299,6 +299,12 @@ func (p PhysicalTableScan) Init(ctx sessionctx.Context, offset int) *PhysicalTab
 	return &p
 }
 
+// Init initializes PhysicalIndexSkipScan.
+func (p PhysicalIndexSkipScan) Init(ctx sessionctx.Context, offset int) *PhysicalIndexSkipScan {
+	p.basePhysicalPlan = newBasePhysicalPlan(ctx, plancodec.TypeIdxSkipScan, &p, offset)
+	return &p
+}
+
 // Init initializes PhysicalIndexScan.
 func (p PhysicalIndexScan) Init(ctx sessionctx.Context, offset int) *PhysicalIndexScan {
 	p.basePhysicalPlan = newBasePhysicalPlan(ctx, plancodec.TypeIdxScan, &p, offset)

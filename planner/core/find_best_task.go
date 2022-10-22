@@ -1429,6 +1429,73 @@ func (ds *DataSource) convertToIndexScan(prop *property.PhysicalProperty,
 	return task, nil
 }
 
+// initSchema is used to set the schema of PhysicalIndexScan. Before calling this,
+// make sure the following field of PhysicalIndexScan are initialized:
+//
+//	PhysicalIndexScan.Table         *model.TableInfo
+//	PhysicalIndexScan.Index         *model.IndexInfo
+//	PhysicalIndexScan.Index.Columns []*IndexColumn
+//	PhysicalIndexScan.IdxCols       []*expression.Column
+//	PhysicalIndexScan.Columns       []*model.ColumnInfo
+func (is *PhysicalIndexSkipScan) initSchema(idxExprCols []*expression.Column, isDoubleRead bool) {
+	indexCols := make([]*expression.Column, len(is.IdxCols), len(is.Index.Columns)+1)
+	copy(indexCols, is.IdxCols)
+
+	for i := len(is.IdxCols); i < len(is.Index.Columns); i++ {
+		if idxExprCols[i] != nil {
+			indexCols = append(indexCols, idxExprCols[i])
+		} else {
+			// TODO: try to reuse the col generated when building the DataSource.
+			indexCols = append(indexCols, &expression.Column{
+				ID:       is.Table.Columns[is.Index.Columns[i].Offset].ID,
+				RetType:  &is.Table.Columns[is.Index.Columns[i].Offset].FieldType,
+				UniqueID: is.ctx.GetSessionVars().AllocPlanColumnID(),
+			})
+		}
+	}
+	is.NeedCommonHandle = is.Table.IsCommonHandle
+
+	if is.NeedCommonHandle {
+		for i := len(is.Index.Columns); i < len(idxExprCols); i++ {
+			indexCols = append(indexCols, idxExprCols[i])
+		}
+	}
+	setHandle := len(indexCols) > len(is.Index.Columns)
+	if !setHandle {
+		for i, col := range is.Columns {
+			if (mysql.HasPriKeyFlag(col.GetFlag()) && is.Table.PKIsHandle) || col.ID == model.ExtraHandleID {
+				indexCols = append(indexCols, is.dataSourceSchema.Columns[i])
+				setHandle = true
+				break
+			}
+		}
+	}
+
+	if isDoubleRead {
+		// If it's double read case, the first index must return handle. So we should add extra handle column
+		// if there isn't a handle column.
+		if !setHandle {
+			if !is.Table.IsCommonHandle {
+				indexCols = append(indexCols, &expression.Column{
+					RetType:  types.NewFieldType(mysql.TypeLonglong),
+					ID:       model.ExtraHandleID,
+					UniqueID: is.ctx.GetSessionVars().AllocPlanColumnID(),
+				})
+			}
+		}
+		// If index is global, we should add extra column for pid.
+		if is.Index.Global {
+			indexCols = append(indexCols, &expression.Column{
+				RetType:  types.NewFieldType(mysql.TypeLonglong),
+				ID:       model.ExtraPidColID,
+				UniqueID: is.ctx.GetSessionVars().AllocPlanColumnID(),
+			})
+		}
+	}
+
+	is.SetSchema(expression.NewSchema(indexCols...))
+}
+
 func (is *PhysicalIndexScan) getScanRowSize() float64 {
 	idx := is.Index
 	scanCols := make([]*expression.Column, 0, len(idx.Columns)+1)
@@ -1829,6 +1896,30 @@ func (s *LogicalTableScan) GetPhysicalScan(schema *expression.Schema, stats *pro
 func (s *LogicalIndexScan) GetPhysicalIndexScan(_ *expression.Schema, stats *property.StatsInfo) *PhysicalIndexScan {
 	ds := s.Source
 	is := PhysicalIndexScan{
+		Table:            ds.tableInfo,
+		TableAsName:      ds.TableAsName,
+		DBName:           ds.DBName,
+		Columns:          s.Columns,
+		Index:            s.Index,
+		IdxCols:          s.IdxCols,
+		IdxColLens:       s.IdxColLens,
+		AccessCondition:  s.AccessConds,
+		Ranges:           s.Ranges,
+		dataSourceSchema: ds.schema,
+		isPartition:      ds.isPartition,
+		physicalTableID:  ds.physicalTableID,
+		tblColHists:      ds.TblColHists,
+		pkIsHandleCol:    ds.getPKIsHandleCol(),
+	}.Init(ds.ctx, ds.blockOffset)
+	is.stats = stats
+	is.initSchema(s.FullIdxCols, s.IsDoubleRead)
+	return is
+}
+
+// GetPhysicalIndexSkipScan returns PhysicalIndexSkipScan for the logical IndexScan.
+func (s *LogicalIndexScan) GetPhysicalIndexSkipScan(_ *expression.Schema, stats *property.StatsInfo) *PhysicalIndexSkipScan {
+	ds := s.Source
+	is := PhysicalIndexSkipScan{
 		Table:            ds.tableInfo,
 		TableAsName:      ds.TableAsName,
 		DBName:           ds.DBName,

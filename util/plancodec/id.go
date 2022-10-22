@@ -43,6 +43,8 @@ const (
 	TypeMemTableScan = "MemTableScan"
 	// TypeUnionScan is the type of UnionScan.
 	TypeUnionScan = "UnionScan"
+	// TypeIdxSkipScan is the type of IndexScan.
+	TypeIdxSkipScan = "IndexSkipScan"
 	// TypeIdxScan is the type of IndexScan.
 	TypeIdxScan = "IndexScan"
 	// TypeSort is the type of Sort.

@@ -64,6 +64,8 @@ const (
 	OperandTableScan
 	// OperandIndexScan is the operand for IndexScan.
 	OperandIndexScan
+	// OperandIndexSkipScan is the operand for IndexScan.
+	OperandIndexSkipScan
 	// OperandShow is the operand for Show.
 	OperandShow
 	// OperandWindow is the operand for window function.
