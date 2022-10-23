@@ -923,8 +923,10 @@ func (p *LogicalIndexScan) ExplainInfo() string {
 // ExplainInfo implements Plan interface.
 func (p *TiKVSingleGather) ExplainInfo() string {
 	buffer := bytes.NewBufferString(p.Source.ExplainInfo())
-	if p.IsIndexGather {
+	if p.IsIndexGather && !p.IsIndexSkipGather {
 		buffer.WriteString(", index:" + p.Index.Name.String())
+	} else if p.IsIndexGather && p.IsIndexSkipGather {
+		buffer.WriteString(", skip index:" + p.Index.Name.String())
 	}
 	return buffer.String()
 }

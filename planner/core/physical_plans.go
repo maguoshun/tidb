@@ -328,6 +328,9 @@ func (p *PhysicalIndexReader) SetSchema(_ *expression.Schema) {
 		switch p.indexPlan.(type) {
 		case *PhysicalHashAgg, *PhysicalStreamAgg, *PhysicalProjection:
 			p.schema = p.indexPlan.Schema()
+		case *PhysicalIndexSkipScan:
+			is := p.IndexPlans[0].(*PhysicalIndexSkipScan)
+			p.schema = is.dataSourceSchema
 		default:
 			is := p.IndexPlans[0].(*PhysicalIndexScan)
 			p.schema = is.dataSourceSchema

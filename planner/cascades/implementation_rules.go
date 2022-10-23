@@ -48,8 +48,6 @@ var defaultImplementationMap = map[memo.Operand][]ImplementationRule{
 	},
 	memo.OperandIndexScan: {
 		&ImplIndexScan{},
-	},
-	memo.OperandIndexSkipScan: {
 		&ImplIndexSkipScan{},
 	},
 	memo.OperandTiKVSingleGather: {
@@ -177,9 +175,14 @@ func (*ImplTiKVSingleReadGather) Match(_ *memo.GroupExpr, _ *property.PhysicalPr
 func (*ImplTiKVSingleReadGather) OnImplement(expr *memo.GroupExpr, reqProp *property.PhysicalProperty) ([]memo.Implementation, error) {
 	logicProp := expr.Group.Prop
 	sg := expr.ExprNode.(*plannercore.TiKVSingleGather)
-	if sg.IsIndexGather {
-		reader := sg.GetPhysicalIndexReader(logicProp.Schema, logicProp.Stats.ScaleByExpectCnt(reqProp.ExpectedCnt), reqProp)
-		return []memo.Implementation{impl.NewIndexReaderImpl(reader, sg.Source)}, nil
+	if sg.IsIndexGather && !sg.IsIndexSkipGather{
+		if sg.IsIndexSkipGather {
+			reader := sg.GetPhysicalIndexReader(logicProp.Schema, logicProp.Stats.ScaleByExpectCnt(reqProp.ExpectedCnt), reqProp)
+			return []memo.Implementation{impl.NewIndexReaderImpl(reader, sg.Source, true)}, nil
+		} else {
+			reader := sg.GetPhysicalIndexReader(logicProp.Schema, logicProp.Stats.ScaleByExpectCnt(reqProp.ExpectedCnt), reqProp)
+			return []memo.Implementation{impl.NewIndexReaderImpl(reader, sg.Source, false)}, nil
+		}
 	}
 	reader := sg.GetPhysicalTableReader(logicProp.Schema, logicProp.Stats.ScaleByExpectCnt(reqProp.ExpectedCnt), reqProp)
 	return []memo.Implementation{impl.NewTableReaderImpl(reader, sg.Source)}, nil

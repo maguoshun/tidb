@@ -1240,6 +1240,7 @@ type TiKVSingleGather struct {
 	// in implementation phase, we need this flag to determine whether to generate
 	// PhysicalTableReader or PhysicalIndexReader.
 	IsIndexGather bool
+	IsIndexSkipGather bool
 	Index         *model.IndexInfo
 }
 
@@ -1302,7 +1303,7 @@ func getTablePath(paths []*util.AccessPath) *util.AccessPath {
 func (ds *DataSource) buildTableGather() LogicalPlan {
 	ts := LogicalTableScan{Source: ds, HandleCols: ds.handleCols}.Init(ds.ctx, ds.blockOffset)
 	ts.SetSchema(ds.Schema())
-	sg := TiKVSingleGather{Source: ds, IsIndexGather: false}.Init(ds.ctx, ds.blockOffset)
+	sg := TiKVSingleGather{Source: ds, IsIndexGather: false, IsIndexSkipGather: true}.Init(ds.ctx, ds.blockOffset)
 	sg.SetSchema(ds.Schema())
 	sg.SetChildren(ts)
 	return sg
@@ -1327,6 +1328,34 @@ func (ds *DataSource) buildIndexGather(path *util.AccessPath) LogicalPlan {
 	sg := TiKVSingleGather{
 		Source:        ds,
 		IsIndexGather: true,
+		IsIndexSkipGather: false,
+		Index:         path.Index,
+	}.Init(ds.ctx, ds.blockOffset)
+	sg.SetSchema(ds.Schema())
+	sg.SetChildren(is)
+	return sg
+}
+
+func (ds *DataSource) buildIndexSkipGather(path *util.AccessPath) LogicalPlan {
+	is := LogicalIndexScan{
+		Source:         ds,
+		IsDoubleRead:   false,
+		Index:          path.Index,
+		FullIdxCols:    path.FullIdxCols,
+		FullIdxColLens: path.FullIdxColLens,
+		IdxCols:        path.IdxCols,
+		IdxColLens:     path.IdxColLens,
+	}.Init(ds.ctx, ds.blockOffset)
+
+	is.Columns = make([]*model.ColumnInfo, len(ds.Columns))
+	copy(is.Columns, ds.Columns)
+	is.SetSchema(ds.Schema())
+	is.IdxCols, is.IdxColLens = expression.IndexInfo2PrefixCols(is.Columns, is.schema.Columns, is.Index)
+
+	sg := TiKVSingleGather{
+		Source:        ds,
+		IsIndexGather: true,
+		IsIndexSkipGather: true,
 		Index:         path.Index,
 	}.Init(ds.ctx, ds.blockOffset)
 	sg.SetSchema(ds.Schema())
@@ -1345,6 +1374,7 @@ func (ds *DataSource) Convert2Gathers() (gathers []LogicalPlan) {
 			// If index columns can cover all of the needed columns, we can use a IndexGather + IndexScan.
 			if ds.isCoveringIndex(ds.schema.Columns, path.FullIdxCols, path.FullIdxColLens, ds.tableInfo) {
 				gathers = append(gathers, ds.buildIndexGather(path))
+				gathers = append(gathers, ds.buildIndexSkipGather(path))
 			}
 			// TODO: If index columns can not cover the schema, use IndexLookUpGather.
 		}

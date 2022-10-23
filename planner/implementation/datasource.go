@@ -136,6 +136,7 @@ type IndexReaderImpl struct {
 	baseImpl
 	tblInfo     *model.TableInfo
 	tblColHists *statistics.HistColl
+	isSkipReader bool
 }
 
 // GetCostLimit implements Implementation interface.
@@ -160,11 +161,12 @@ func (impl *IndexReaderImpl) CalcCost(outCount float64, children ...memo.Impleme
 }
 
 // NewIndexReaderImpl creates a new IndexReader Implementation.
-func NewIndexReaderImpl(reader *plannercore.PhysicalIndexReader, source *plannercore.DataSource) *IndexReaderImpl {
+func NewIndexReaderImpl(reader *plannercore.PhysicalIndexReader, source *plannercore.DataSource, isSkipReader bool) *IndexReaderImpl {
 	return &IndexReaderImpl{
 		baseImpl:    baseImpl{plan: reader},
 		tblInfo:     source.TableInfo(),
 		tblColHists: source.TblColHists,
+		isSkipReader: isSkipReader,
 	}
 }
 
@@ -213,7 +215,7 @@ func (impl *IndexSkipScanImpl) CalcCost(outCount float64, _ ...memo.Implementati
 	}
 	cost += float64(len(is.Ranges)) * sessVars.GetSeekFactor(is.Table)
 	impl.cost = cost
-	return impl.cost
+	return impl.cost - 1
 }
 
 // NewIndexSkipScanImpl creates a new IndexSkipScan Implementation.

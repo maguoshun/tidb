@@ -461,10 +461,10 @@ func (d *rangeDetacher) detachCNFCondAndBuildRangeForIndex(conditions []expressi
 	return res, nil
 }
 
-// detachCNFCondAndBuildRangeForSkipIndex will detach the index filters from table filters. These conditions are connected with `and`
+// detachCNFCondAndBuildRangeForIndexSkip will detach the index filters from table filters. These conditions are connected with `and`
 // It will first find the point query column and then extract the range query column.
 // considerDNF is true means it will try to extract access conditions from the DNF expressions.
-func (d *rangeDetacher) detachCNFCondAndBuildRangeForSkipIndex(conditions []expression.Expression, tpSlice []*types.FieldType, considerDNF bool) (*DetachRangeResult, error) {
+func (d *rangeDetacher) detachCNFCondAndBuildRangeForIndexSkip(conditions []expression.Expression, tpSlice []*types.FieldType, considerDNF bool) (*DetachRangeResult, error) {
 	var (
 		eqCount int
 		ranges  Ranges
@@ -1023,7 +1023,7 @@ func DetachCondAndBuildRangeForIndex(sctx sessionctx.Context, conditions []expre
 // rangeMaxSize is the max memory limit for ranges. O indicates no memory limit. If you ask that all conditions must be used
 // for building ranges, set rangeMemQuota to 0 to avoid range fallback.
 // The returned values are encapsulated into a struct DetachRangeResult, see its comments for explanation.
-func DetachCondAndBuildRangeForSkipIndex(sctx sessionctx.Context, conditions []expression.Expression, cols []*expression.Column,
+func DetachCondAndBuildRangeForIndexSkip(sctx sessionctx.Context, conditions []expression.Expression, cols []*expression.Column,
 	lengths []int, rangeMaxSize int64) (*DetachRangeResult, error) {
 	d := &rangeDetacher{
 		sctx:             sctx,
@@ -1037,7 +1037,7 @@ func DetachCondAndBuildRangeForSkipIndex(sctx sessionctx.Context, conditions []e
 	for _, col := range d.cols {
 		newTpSlice = append(newTpSlice, newFieldType(col.RetType))
 	}
-	return d.detachCNFCondAndBuildRangeForSkipIndex(d.allConds, newTpSlice, true)
+	return d.detachCNFCondAndBuildRangeForIndexSkip(d.allConds, newTpSlice, true)
 }
 
 // DetachCondAndBuildRangeForPartition will detach the index filters from table filters.

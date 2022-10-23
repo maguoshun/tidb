@@ -234,7 +234,7 @@ func NewRulePushSelDownIndexSkipScan() Transformation {
 	rule.pattern = memo.BuildPattern(
 		memo.OperandSelection,
 		memo.EngineTiKVOnly,
-		memo.NewPattern(memo.OperandIndexSkipScan, memo.EngineTiKVOnly),
+		memo.NewPattern(memo.OperandIndexScan, memo.EngineTiKVOnly),
 	)
 	return rule
 }
@@ -265,7 +265,7 @@ func (*PushSelDownIndexSkipScan) OnTransform(old *memo.ExprIter) (newExprs []*me
 		copy(conditions, sel.Conditions)
 		copy(conditions[len(sel.Conditions):], is.AccessConds)
 	}
-	res, err := ranger.DetachCondAndBuildRangeForSkipIndex(is.SCtx(), conditions, is.IdxCols, is.IdxColLens, is.SCtx().GetSessionVars().RangeMaxSize)
+	res, err := ranger.DetachCondAndBuildRangeForIndexSkip(is.SCtx(), conditions, is.IdxCols, is.IdxColLens, is.SCtx().GetSessionVars().RangeMaxSize)
 	if err != nil {
 		return nil, false, false, err
 	}
